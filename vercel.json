@@ -1,5 +1,3 @@
 {
-	"buildCommand": "npm run build",
-	"outputDirectory": ".svelte-kit/output",
-	"framework": "sveltekit-5"
+	"framework": "sveltekit"
 }
