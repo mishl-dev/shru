@@ -1,0 +1,56 @@
+/* ════════════════════════════════════════════════════
+   Shru — warmed-industrial palette
+   ════════════════════════════════════════════════════ */
+
+/* ---- Reset ---- */
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+/* ---- Theme ---- */
+:root {
+	--bg: #0f0d0b;
+	--surface: #1a1715;
+	--surface-2: #221f1c;
+	--border: #2e2a27;
+	--border-hover: #3d3834;
+	--accent: #b8541d;
+	--accent-hover: #c9662f;
+	--accent-soft: rgba(184, 84, 29, 0.08);
+	--accent-glow: rgba(184, 84, 29, 0.10);
+	--ink: #ece8e4;
+	--ink-muted: #9e968e;
+	--ink-faint: #6b6560;
+	--success: #2a8c4e;
+	--error: #c94a4a;
+	--error-soft: rgba(201, 74, 74, 0.10);
+	--radius-sm: 4px;
+	--radius-md: 8px;
+
+	font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+	font-size: 15px;
+	line-height: 1.5;
+	color: var(--ink);
+	background-color: var(--bg);
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+body {
+	min-height: 100vh;
+}
+
+a {
+	color: inherit;
+	text-decoration: none;
+}
+
+/* ---- Selection ---- */
+::selection {
+	background: var(--accent-soft);
+	color: var(--ink);
+}
