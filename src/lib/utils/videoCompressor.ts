@@ -4,10 +4,10 @@ import type { CompressionProgress } from './types';
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 
-// ffmpeg-core served locally from the static directory.
-// This avoids CORS and blob-URL issues with web workers.
-const CORE_URL = '/ffmpeg/ffmpeg-core.js';
-const WASM_URL = '/ffmpeg/ffmpeg-core.wasm';
+// ffmpeg-core served from unpkg CDN to avoid deployment issues with large WASM files.
+// Version matches @ffmpeg/core in package.json.
+const CORE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js';
+const WASM_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm';
 
 interface EncodeAttempt {
 	crf: number;
