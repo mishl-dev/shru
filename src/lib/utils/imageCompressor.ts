@@ -9,31 +9,36 @@ import type { CompressionProgress } from './types';
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_DIMENSION = 4000;
 const INITIAL_QUALITY = 85;
+const MAX_QUALITY = 100;
 const MIN_QUALITY = 1;
 
-let wasmInitialized = false;
+let wasmInitPromise: Promise<void> | null = null;
 
 /**
  * Lazily initialize the ImageMagick WASM engine.
  * Fetches the wasm binary via the Vite-resolved URL.
+ * Guards against concurrent initialization via a shared promise.
  */
 async function ensureWasm(): Promise<void> {
-	if (wasmInitialized) return;
+	if (wasmInitPromise) return wasmInitPromise;
 	console.log('[image] initializing ImageMagick WASM…');
-	try {
-		const wasmUrl = new URL(
-			'@imagemagick/magick-wasm/magick.wasm',
-			import.meta.url
-		).href;
-		const response = await fetch(wasmUrl);
-		const wasmBytes = new Uint8Array(await response.arrayBuffer());
-		await initializeImageMagick(wasmBytes);
-		wasmInitialized = true;
-		console.log('[image] ImageMagick WASM ready');
-	} catch (err) {
-		console.error('[image] failed to initialize ImageMagick WASM:', err);
-		throw new Error('Failed to load image compression engine. Please try again.');
-	}
+	wasmInitPromise = (async () => {
+		try {
+			const wasmUrl = new URL(
+				'@imagemagick/magick-wasm/magick.wasm',
+				import.meta.url
+			).href;
+			const response = await fetch(wasmUrl);
+			const wasmBytes = new Uint8Array(await response.arrayBuffer());
+			await initializeImageMagick(wasmBytes);
+			console.log('[image] ImageMagick WASM ready');
+		} catch (err) {
+			wasmInitPromise = null; // Allow next caller to retry
+			console.error('[image] failed to initialize ImageMagick WASM:', err);
+			throw new Error('Failed to load image compression engine. Please try again.');
+		}
+	})();
+	return wasmInitPromise;
 }
 
 /**
@@ -109,7 +114,8 @@ export async function compressImage(
 	});
 
 	await reportProgress(onProgress, 100, 'Done');
-	const result = new Blob([initialResult.slice(0)], { type: 'image/webp' });
+		// Copy out of WASM memory: ImageMagick may reuse the underlying buffer
+		const result = new Blob([initialResult.slice(0)], { type: 'image/webp' });
 	console.log(`[image] done — ${(initialResult.length / 1024).toFixed(1)} KB, saved ${Math.round((1 - initialResult.length / inputBytes.length) * 100)}%`);
 	return result;
 }
@@ -143,12 +149,12 @@ async function binarySearchQuality(
 	let bestData = await writeImage(image);
 	console.log(`[image] quality ${INITIAL_QUALITY}: ${(bestData.length / 1024).toFixed(1)} KB ${bestData.length <= MAX_BYTES ? '✓ under limit' : '✗ over limit'}`);
 
-	if (bestData.length <= MAX_BYTES) {
-		// Try to increase quality for better result
-		console.log('[image] under limit — refining quality upward');
-		await reportProgress(onProgress, Math.round(startPct + range * 0.1), 'Refining quality…');
-		return refineQuality(image, MIN_QUALITY, INITIAL_QUALITY, onProgress, startPct);
-	}
+		if (bestData.length <= MAX_BYTES) {
+			// Try to increase quality for better result
+			console.log('[image] under limit — refining quality upward');
+			await reportProgress(onProgress, Math.round(startPct + range * 0.1), 'Refining quality…');
+			return refineQuality(image, INITIAL_QUALITY, MAX_QUALITY, onProgress, startPct);
+		}
 
 	// Binary search on quality
 	let low = MIN_QUALITY;

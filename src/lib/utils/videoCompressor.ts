@@ -10,90 +10,89 @@ const CORE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js
 const WASM_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm';
 
 interface EncodeAttempt {
-	crf: number;
-	resolution: string;
-	videoBitrate: string;
-	audioBitrate: string;
-	audioChannels: number;
-	label: string;
-}
-
-/**
- * Progressive encoding strategies from best quality to most aggressive.
- * Each step tries harder compression to get under 10 MB.
- */
-const ATTEMPTS: EncodeAttempt[] = [
-	{
-		crf: 23,
-		resolution: '1920:1080',
-		videoBitrate: '',
-		audioBitrate: '128k',
-		audioChannels: 2,
-		label: '1080p High Quality'
-	},
-	{
-		crf: 28,
-		resolution: '1280:720',
-		videoBitrate: '',
-		audioBitrate: '96k',
-		audioChannels: 2,
-		label: '720p Balanced'
-	},
-	{
-		crf: 32,
-		resolution: '854:480',
-		videoBitrate: '',
-		audioBitrate: '64k',
-		audioChannels: 1,
-		label: '480p Aggressive'
-	},
-	{
-		crf: 40,
-		resolution: '640:360',
-		videoBitrate: '',
-		audioBitrate: '48k',
-		audioChannels: 1,
-		label: '360p Maximum'
+		crf: number;
+		resolution: string;
+		audioBitrate: string;
+		audioChannels: number;
+		label: string;
 	}
-];
+	
+	/**
+	 * Progressive encoding strategies from best quality to most aggressive.
+	 * Each step tries harder compression to get under 10 MB.
+	 */
+	const ATTEMPTS: EncodeAttempt[] = [
+		{
+			crf: 23,
+			resolution: '1920:1080',
+			audioBitrate: '128k',
+			audioChannels: 2,
+			label: '1080p High Quality'
+		},
+		{
+			crf: 28,
+			resolution: '1280:720',
+			audioBitrate: '96k',
+			audioChannels: 2,
+			label: '720p Balanced'
+		},
+		{
+			crf: 32,
+			resolution: '854:480',
+			audioBitrate: '64k',
+			audioChannels: 1,
+			label: '480p Aggressive'
+		},
+		{
+			crf: 40,
+			resolution: '640:360',
+			audioBitrate: '48k',
+			audioChannels: 1,
+			label: '360p Maximum'
+		}
+	];
 
 let ffmpeg: FFmpeg | null = null;
-let loaded = false;
+let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
 
 /**
  * Lazily initialize the ffmpeg WASM engine.
  * Loads ffmpeg-core from CDN directly.
+ * Guards against concurrent initialization via a shared promise,
+ * and recreates the instance if loading fails.
  */
 async function ensureFfmpeg(
 	onProgress?: (progress: CompressionProgress) => void
 ): Promise<FFmpeg> {
-	if (ffmpeg && loaded) {
+	if (ffmpeg) {
 		console.log('[video] engine already loaded');
 		return ffmpeg;
 	}
+	if (ffmpegLoadPromise) return ffmpegLoadPromise;
 
 	console.log('[video] initializing ffmpeg WASM…');
 	onProgress?.({ percent: 0, status: 'Loading video compression engine…' });
 
-	if (!ffmpeg) {
-		ffmpeg = new FFmpeg();
-
-		// Forward log events
-		ffmpeg.on('log', ({ message }: { message: string }) => {
+	ffmpegLoadPromise = (async () => {
+		const instance = new FFmpeg();
+		instance.on('log', ({ message }: { message: string }) => {
 			console.log('[ffmpeg]', message);
 		});
-	}
 
-	try {
-		await ffmpeg.load({ coreURL: CORE_URL, wasmURL: WASM_URL });
-		loaded = true;
-		console.log('[video] ffmpeg WASM ready');
-	} catch (err) {
-		console.error('[video] failed to load ffmpeg WASM:', err);
-		throw new Error('Failed to load video compression engine.');
-	}
+		try {
+			await instance.load({ coreURL: CORE_URL, wasmURL: WASM_URL });
+			ffmpeg = instance;
+			console.log('[video] ffmpeg WASM ready');
+		} catch (err) {
+			ffmpegLoadPromise = null; // Allow next caller to retry with a fresh instance
+			console.error('[video] failed to load ffmpeg WASM:', err);
+			throw new Error('Failed to load video compression engine.');
+		}
 
-	return ffmpeg;
+		return ffmpeg!;
+	})();
+
+	return ffmpegLoadPromise;
 }
 
 /**
@@ -142,7 +141,7 @@ function buildArgs(
 	outputName: string,
 	attempt: EncodeAttempt
 ): string[] {
-	const args = [
+	return [
 		'-i',
 		inputName,
 		'-c:v',
@@ -163,13 +162,6 @@ function buildArgs(
 		'+faststart',
 		outputName
 	];
-
-	// Insert video bitrate if specified
-	if (attempt.videoBitrate) {
-		args.splice(4, 0, '-b:v', attempt.videoBitrate);
-	}
-
-	return args;
 }
 
 /**
@@ -262,16 +254,13 @@ export async function compressVideo(
 				continue;
 			}
 
-			// Read output and check size
-				const outputData = await ff.readFile(outputName);
-				const outputBytes =
-					outputData instanceof Uint8Array
-						? new Uint8Array(outputData)
-						: new Uint8Array(
-								(typeof outputData === 'string' ? outputData : '')
-									.split('')
-									.map((c) => c.charCodeAt(0))
-							);
+				// Read output and check size
+					const outputData = await ff.readFile(outputName);
+					// .slice(0) copies out of WASM memory and satisfies BlobPart typing
+					const outputBytes =
+						outputData instanceof Uint8Array
+							? outputData.slice(0)
+							: new TextEncoder().encode(outputData ?? '').slice(0);
 
 				const sizeMB = (outputBytes.length / (1024 * 1024)).toFixed(2);
 				console.log(`[video]   output: ${sizeMB} MB — ${outputBytes.length <= MAX_BYTES ? '✓ under limit' : '✗ over limit'}`);

@@ -14,9 +14,11 @@
 	let enginesReady = $state(false);
 
 	$effect(() => {
+		let aborted = false;
 		Promise.all([initImageEngine(), initVideoEngine()])
-			.then(() => { enginesReady = true; })
-			.catch(() => console.warn('pre-init failed, will retry on demand'));
+			.then(() => { if (!aborted) enginesReady = true; })
+			.catch(() => { if (!aborted) console.warn('pre-init failed, will retry on demand'); });
+		return () => { aborted = true; };
 	});
 
 	function onDrop(e: DragEvent) {
