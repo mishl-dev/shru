@@ -5,7 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
-		"build": "vite build",
+		"build": "cp -n node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.{js,wasm} static/ffmpeg/ 2>/dev/null; vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"postinstall": "cp -n node_modules/@ffmpeg/core/dist/esm/ffmpeg-core.{js,wasm} static/ffmpeg/ 2>/dev/null; echo ''",
