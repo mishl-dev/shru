@@ -27,5 +27,8 @@
 		"@ffmpeg/util": "^0.12.2",
 		"@imagemagick/magick-wasm": "^0.0.41",
 		"@sveltejs/adapter-vercel": "^6.3.4"
+	},
+	"overrides": {
+		"cookie": "^0.7.0"
 	}
 }
