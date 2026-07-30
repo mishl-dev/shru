@@ -1,4 +1,4 @@
-export type FileType = 'image' | 'video' | 'other';
+export type FileType = 'image' | 'video' | 'audio' | 'other';
 
 export type AppStatus = 'idle' | 'loading-engine' | 'compressing' | 'done' | 'error';
 

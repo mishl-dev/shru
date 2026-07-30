@@ -725,3 +725,224 @@ function getExtension(filename: string): string {
 	if (dot === -1) return '.mp4';
 	return filename.slice(dot);
 }
+
+// ── audio ────────────────────────────────────────────────────────────
+
+/** MP3 tops out at 320 — plenty for music. */
+const AUDIO_MAX_KBPS = 320;
+
+/** AAC-ish floor for intelligible speech (mono). */
+const AUDIO_MIN_KBPS = 24;
+
+/**
+ * Longest audio that can plausibly fit the 10 MB target at the bitrate
+ * floor, plus 15% slack for best-effort attempts (~66 min).
+ */
+export function maxAudioFeasibleSeconds(): number {
+	return ((TARGET_BYTES * 8) / (AUDIO_MIN_KBPS * 1000)) * 1.15;
+}
+
+/**
+ * Compress an audio file to under 10 MB using the same ffmpeg WASM
+ * engine as compressVideo (shared instance, shared cancellation).
+ *
+ * Budget: TARGET_BYTES × 8 ÷ duration, clamped to 24–320 kbps.
+ * Encoded as MP3 (universal inline playback on Discord); falls back to
+ * AAC/m4a if the core build lacks libmp3lame. One measured correction
+ * if the first pass overshoots.
+ */
+export async function compressAudio(
+	file: File,
+	onProgress?: (progress: CompressionProgress) => void,
+	meta?: { duration?: number | null }
+): Promise<Blob> {
+	if (file.size > MAX_INPUT_BYTES) {
+		throw new Error('file is too large for in-browser compression (limit ~1.5 GB)');
+	}
+
+	// Cancel any prior in-flight compression (audio or video)
+	_cancel?.();
+	const ff = await ensureFfmpeg(onProgress);
+
+	const inputName = 'input' + getExtension(file.name);
+	const MP3_OUT = 'output.mp3';
+	const M4A_OUT = 'output.m4a';
+
+	// ── cancellation plumbing (mirrors compressVideo) ────────────────
+	let aborted = false;
+	const abortController = new AbortController();
+	const signal = abortController.signal;
+
+	_cancel = () => {
+		if (aborted) return;
+		aborted = true;
+		abortController.abort();
+		ffmpeg = null;
+		ffmpegLoadPromise = null;
+	};
+
+	// ── log collector (rolling window + throttled push) ───────────────
+	const logs: string[] = [];
+	let currentPercent = 0;
+	let currentStatus = '';
+	let lastLogEmit = 0;
+	const logHandler = ({ message }: { message: string }) => {
+		if (logs.length >= MAX_LOG_LINES) logs.shift();
+		logs.push(message);
+		const now = Date.now();
+		if (now - lastLogEmit > 250) {
+			lastLogEmit = now;
+			onProgress?.({ percent: currentPercent, status: currentStatus, logs: [...logs] });
+		}
+	};
+	ff.on('log', logHandler);
+
+	function checkAborted(): void {
+		if (aborted) throw new Error('Cancelled');
+	}
+
+	function emitProgress(percent: number, status: string): void {
+		currentPercent = percent;
+		currentStatus = status;
+		onProgress?.({ percent, status, logs: [...logs] });
+	}
+
+	let progressCallback: ((e: { progress: number }) => void) | null = null;
+
+	async function runEncode(
+		args: string[],
+		outName: string,
+		label: string
+	): Promise<Uint8Array<ArrayBuffer>> {
+		checkAborted();
+		try {
+			await ff.deleteFile(outName);
+		} catch {
+			/* may not exist */
+		}
+		if (progressCallback) ff.off('progress', progressCallback);
+		emitProgress(15, label);
+		progressCallback = ({ progress: p }: { progress: number }) => {
+			emitProgress(Math.round(15 + 75 * p), `${label} ${Math.round(p * 100)}%`);
+		};
+		ff.on('progress', progressCallback);
+		console.log(`[audio]   args: ffmpeg ${args.join(' ')}`);
+
+		const execPromise = ff.exec(args, ENCODE_TIMEOUT);
+		const cancelPromise = new Promise<never>((_, reject) => {
+			if (signal.aborted) return reject(new Error('Cancelled'));
+			const onAbort = () => reject(new Error('Cancelled'));
+			signal.addEventListener('abort', onAbort, { once: true });
+			execPromise.then(
+				() => signal.removeEventListener('abort', onAbort),
+				() => signal.removeEventListener('abort', onAbort)
+			);
+		});
+		const exitCode = await Promise.race([execPromise, cancelPromise]);
+		if (exitCode !== 0) throw new Error(`FFmpeg exited with code ${exitCode}`);
+		const data = await ff.readFile(outName);
+		return data instanceof Uint8Array
+			? data.slice(0)
+			: new TextEncoder().encode(data ?? '').slice(0);
+	}
+
+	/** mp3 args; aac fallback only differs by codec/container. */
+	function buildAudioArgs(outName: string, kbps: number, channels: number, codec: 'mp3' | 'aac'): string[] {
+		const args = ['-i', inputName, '-vn'];
+		if (codec === 'mp3') {
+			args.push('-c:a', 'libmp3lame');
+		} else {
+			args.push('-c:a', 'aac', '-movflags', '+faststart');
+		}
+		args.push('-b:a', `${kbps}k`, '-ac', String(channels), outName);
+		return args;
+	}
+
+	try {
+		console.log(
+			`[audio] compressing ${file.name} — ${(file.size / (1024 * 1024)).toFixed(2)} MB, type: ${file.type}`
+		);
+		emitProgress(5, 'Reading audio file…');
+		await ff.writeFile(inputName, await fetchFile(file));
+		checkAborted();
+
+		emitProgress(10, 'Analyzing audio…');
+		let duration = meta?.duration && meta.duration > 0 ? meta.duration : null;
+		if (!duration) {
+			duration = (await probeMetadata(ff, inputName)).duration;
+		}
+		console.log(`[audio] duration: ${duration ? duration.toFixed(1) + 's' : 'unknown'}`);
+
+		let kbps = 128; // sane default when duration is unknown
+		if (duration) {
+			const totalKbps = (TARGET_BYTES * 8) / duration / 1000;
+			kbps = Math.round(Math.min(Math.max(totalKbps, AUDIO_MIN_KBPS), AUDIO_MAX_KBPS));
+			console.log(`[audio] budget ${totalKbps.toFixed(0)}k → ${kbps}k`);
+		}
+
+		let best: { bytes: Uint8Array<ArrayBuffer>; type: string } | null = null;
+
+		for (let pass = 0; pass < 2; pass++) {
+			checkAborted();
+			const channels = kbps >= 64 ? 2 : 1;
+			const label = `Encoding (MP3 ${kbps} kbps${channels === 1 ? ' mono' : ''})…`;
+			console.log(`[audio] pass ${pass + 1}: ${label}`);
+
+			let bytes: Uint8Array<ArrayBuffer>;
+			let type = 'audio/mpeg';
+			try {
+				bytes = await runEncode(buildAudioArgs(MP3_OUT, kbps, channels, 'mp3'), MP3_OUT, label);
+			} catch (err) {
+				if (aborted) throw new Error('Cancelled');
+				// libmp3lame missing from this core build → AAC in m4a instead
+				console.warn(`[audio]   mp3 encode failed (${err}) — falling back to AAC/m4a`);
+				bytes = await runEncode(
+					buildAudioArgs(M4A_OUT, kbps, channels, 'aac'),
+					M4A_OUT,
+					label.replace('MP3', 'AAC')
+				);
+				type = 'audio/mp4';
+			}
+
+			const sizeMB = (bytes.length / (1024 * 1024)).toFixed(2);
+			console.log(`[audio]   output: ${sizeMB} MB`);
+			if (!best || bytes.length < best.bytes.length) best = { bytes, type };
+
+			if (bytes.length <= MAX_BYTES) {
+				console.log(
+					`[audio] ✓ ${(file.size / (1024 * 1024)).toFixed(2)} MB → ${sizeMB} MB`
+				);
+				emitProgress(95, `Compressed to ${sizeMB} MB`);
+				return new Blob([bytes], { type });
+			}
+
+			// Oversize: correct bitrate by the measured ratio, once
+			const next = Math.max(
+				AUDIO_MIN_KBPS,
+				Math.round(kbps * (TARGET_BYTES / bytes.length) * 0.97)
+			);
+			if (pass === 1 || next >= kbps) break;
+			console.log(`[audio]   over target — correcting to ${next}k`);
+			kbps = next;
+		}
+
+		if (best) {
+			const sizeMB = (best.bytes.length / (1024 * 1024)).toFixed(2);
+			console.log(`[audio] ✓ best effort: ${sizeMB} MB`);
+			emitProgress(95, `Best effort: ${sizeMB} MB`);
+			return new Blob([best.bytes], { type: best.type });
+		}
+		throw new Error('Compression failed: ffmpeg could not encode this file.');
+	} finally {
+		_cancel = null;
+		ff.off('log', logHandler);
+		if (progressCallback) ff.off('progress', progressCallback);
+		for (const name of [inputName, MP3_OUT, M4A_OUT]) {
+			try {
+				await ff.deleteFile(name);
+			} catch {
+				/* best effort */
+			}
+		}
+	}
+}

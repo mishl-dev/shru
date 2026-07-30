@@ -4,10 +4,12 @@
 		compressVideo,
 		initVideoEngine,
 		cancelCompression,
+		compressAudio,
 		MAX_INPUT_BYTES,
-		maxFeasibleSeconds
+		maxFeasibleSeconds,
+		maxAudioFeasibleSeconds
 	} from '$lib/utils/videoCompressor';
-	import { deriveFileInfo, formatSize, probeVideoMetadata, supportsWasm } from '$lib/utils/fileUtils';
+	import { deriveFileInfo, formatSize, probeMediaMetadata, supportsWasm } from '$lib/utils/fileUtils';
 	import type { AppStatus, CompressionProgress, CompressionResult } from '$lib/utils/types';
 
 	let status = $state<AppStatus>('idle');
@@ -98,18 +100,19 @@
 		// ── video feasibility preflight ──────────────────────────────
 		// Runs before anything heavy: catches the cases that would
 		// otherwise crash the tab or burn an hour for a hopeless result.
-		if (fileInfo.type === 'video') {
+		if (fileInfo.type === 'video' || fileInfo.type === 'audio') {
+			const kind = fileInfo.type;
 			if (file.size > MAX_INPUT_BYTES) {
 				errorMessage = `${formatSize(file.size)} is too large for in-browser compression — the whole file must fit in memory, so the limit is ~1.5 GB`;
 				status = 'error';
 				return;
 			}
-			const meta = await probeVideoMetadata(file);
+			const meta = await probeMediaMetadata(file);
 			if (!file) return; // user cancelled while probing
-			const maxSecs = maxFeasibleSeconds();
+			const maxSecs = kind === 'video' ? maxFeasibleSeconds() : maxAudioFeasibleSeconds();
 			if (meta && meta.duration > maxSecs) {
 				const mins = Math.round(meta.duration / 60);
-				errorMessage = `this video is ~${mins} min long — 10 MB holds at most ~${Math.floor(maxSecs / 60)} min of video at the lowest watchable quality, so trim it first`;
+				errorMessage = `this ${kind} is ~${mins} min long — 10 MB holds at most ~${Math.floor(maxSecs / 60)} min of ${kind} at the lowest usable quality, so trim it first`;
 				status = 'error';
 				return;
 			}
@@ -134,8 +137,10 @@
 			let blob: Blob;
 			if (fileInfo.type === 'image') {
 				blob = await compressImage(file, (p) => (progress = p));
-		} else if (fileInfo.type === 'video') {
-			blob = await compressVideo(file, (p) => (progress = p), progressMeta ?? undefined);
+			} else if (fileInfo.type === 'video') {
+				blob = await compressVideo(file, (p) => (progress = p), progressMeta ?? undefined);
+			} else if (fileInfo.type === 'audio') {
+				blob = await compressAudio(file, (p) => (progress = p), progressMeta ?? undefined);
 			} else {
 				throw new Error('unsupported file type');
 			}
@@ -163,7 +168,14 @@
 		const a = document.createElement('a');
 		a.href = result.url;
 		const base = file?.name?.replace(/\.[^/.]+$/, '') ?? 'file';
-		const ext = fileInfo?.type === 'image' ? 'webp' : 'mp4';
+		const ext =
+			fileInfo?.type === 'image'
+				? 'webp'
+				: fileInfo?.type === 'video'
+					? 'mp4'
+					: result.blob.type === 'audio/mpeg'
+						? 'mp3'
+						: 'm4a';
 		a.download = `${base}-compressed.${ext}`;
 		document.body.appendChild(a);
 		a.click();
@@ -190,7 +202,7 @@
 		tabindex="0"
 		onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); (e.target as HTMLElement).querySelector('input')?.click(); } }}
 	>
-		<input type="file" accept="image/*,video/*" onchange={onSelect} />
+		<input type="file" accept="image/*,video/*,audio/*" onchange={onSelect} />
 
 		{#if !file}
 			<div class="content">
@@ -222,6 +234,8 @@
 						<img src={result.url} alt="" />
 					{:else if fileInfo?.type === 'video'}
 						<video src={result.url} controls muted playsinline></video>
+					{:else if fileInfo?.type === 'audio'}
+						<audio src={result.url} controls></audio>
 					{/if}
 				</div>
 				<div class="actions">
