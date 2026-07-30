@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { compressImage, initImageEngine } from '$lib/utils/imageCompressor';
-	import { compressVideo, initVideoEngine } from '$lib/utils/videoCompressor';
+	import { compressVideo, initVideoEngine, cancelCompression } from '$lib/utils/videoCompressor';
 	import { deriveFileInfo, supportsWasm } from '$lib/utils/fileUtils';
 	import type { AppStatus, CompressionProgress, CompressionResult } from '$lib/utils/types';
 
@@ -11,17 +11,17 @@
 	let result = $state<CompressionResult | null>(null);
 	let errorMessage = $state<string | null>(null);
 	let dragOver = $state(false);
-	let enginesReady = $state(false);
+		let enginesReady = $state(false);
 
-	$effect(() => {
-		let aborted = false;
-		Promise.all([initImageEngine(), initVideoEngine()])
-			.then(() => { if (!aborted) enginesReady = true; })
-			.catch(() => { if (!aborted) console.warn('pre-init failed, will retry on demand'); });
-		return () => { aborted = true; };
-	});
+		$effect(() => {
+			let aborted = false;
+			Promise.all([initImageEngine(), initVideoEngine()])
+				.then(() => { if (!aborted) enginesReady = true; })
+				.catch(() => { if (!aborted) console.warn('pre-init failed, will retry on demand'); });
+			return () => { aborted = true; };
+		});
 
-	function onDrop(e: DragEvent) {
+		function onDrop(e: DragEvent) {
 		dragOver = false;
 		const files = e.dataTransfer?.files;
 		if (files && files.length > 0) setFile(files[0]);
@@ -51,11 +51,19 @@
 	}
 
 	function clearFile() {
+		cancelCompression();
 		if (result?.url) URL.revokeObjectURL(result.url);
 		file = null;
 		result = null;
 		errorMessage = null;
 		status = 'idle';
+		progress = { percent: 0, status: '' };
+	}
+
+	function handleCancel() {
+		cancelCompression();
+		status = 'idle';
+		file = null;
 		progress = { percent: 0, status: '' };
 	}
 
@@ -94,7 +102,12 @@
 			};
 			status = 'done';
 		} catch (err) {
-			errorMessage = err instanceof Error ? err.message : 'compression failed';
+			const msg = err instanceof Error ? err.message : 'compression failed';
+			if (msg === 'Cancelled') {
+				handleCancel();
+				return;
+			}
+			errorMessage = msg;
 			status = 'error';
 		}
 	}
@@ -115,7 +128,13 @@
 </script>
 
 <div class="page">
-	<div class="drop"
+	<header class="header">
+		<h1 class="title">Shru</h1>
+		<p class="tagline">A client-side media compressor</p>
+	</header>
+
+	<div
+		class="drop"
 		class:drop-active={dragOver}
 		class:drop-has={status === 'compressing' || status === 'loading-engine' || status === 'done' || status === 'error'}
 		ondragover={(e) => { e.preventDefault(); dragOver = true; }}
@@ -140,6 +159,11 @@
 				<div class="bar-wrap">
 					<div class="bar" style="width:{progress.percent}%"></div>
 				</div>
+				<button class="cancel-btn" onclick={handleCancel}>cancel</button>
+
+				{#if progress.logs && progress.logs.length > 0}
+						<p class="log-last">{progress.logs[progress.logs.length - 1]}</p>
+					{/if}
 			</div>
 		{:else if status === 'done' && result}
 			<div class="content">
@@ -174,8 +198,35 @@
 		align-items: center;
 		justify-content: center;
 		padding: 1.5rem;
+		gap: 1.5rem;
 	}
 
+	/* ── header ────────────────────────────────────────── */
+	.header {
+		text-align: center;
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+	}
+
+	.title {
+		font-size: 1.35rem;
+		font-weight: 500;
+		letter-spacing: 0.06em;
+		text-transform: lowercase;
+		color: var(--ink);
+		margin: 0;
+		line-height: 1;
+	}
+
+	.tagline {
+		font-size: 0.8125rem;
+		color: var(--ink-faint);
+		margin: 0;
+		line-height: 1.4;
+	}
+
+	/* ── drop zone ─────────────────────────────────────── */
 	.drop {
 		width: 100%;
 		max-width: 520px;
@@ -220,6 +271,7 @@
 		display: none;
 	}
 
+	/* ── inner content ─────────────────────────────────── */
 	.content {
 		display: flex;
 		flex-direction: column;
@@ -257,6 +309,46 @@
 		transition: width 0.15s ease;
 	}
 
+	/* ── cancel button ─────────────────────────────────── */
+	.cancel-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0.5rem 1rem;
+		font-size: 0.75rem;
+		font-weight: 500;
+		line-height: 1;
+		color: var(--error);
+		background: transparent;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		cursor: pointer;
+		transition:
+			background 0.15s ease,
+			border-color 0.15s ease;
+		font-family: inherit;
+		user-select: none;
+	}
+
+	.cancel-btn:hover {
+		background: color-mix(in srgb, var(--error) 8%, transparent);
+		border-color: var(--error);
+	}
+
+		/* ── log last line ───────────────────────────────── */
+		.log-last {
+			width: 100%;
+			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+			font-size: 0.6875rem;
+			line-height: 1.4;
+			color: var(--ink-faint);
+			text-align: left;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		/* ── preview ───────────────────────────────────────── */
 	.preview {
 		width: 100%;
 	}

@@ -2,7 +2,9 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
 import type { CompressionProgress } from './types';
 
-const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB target
+const ATTEMPT_TIMEOUT = 40 * 60 * 1000; // 40 minutes per attempt
+const MAX_LOG_LINES = 500;
 
 // ffmpeg-core served from unpkg CDN to avoid deployment issues with large WASM files.
 // Version matches @ffmpeg/core in package.json.
@@ -10,50 +12,67 @@ const CORE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js
 const WASM_URL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.wasm';
 
 interface EncodeAttempt {
-		crf: number;
-		resolution: string;
-		audioBitrate: string;
-		audioChannels: number;
-		label: string;
+	crf: number;
+	resolution: string;
+	audioBitrate: string;
+	audioChannels: number;
+	label: string;
+}
+
+interface BestResult {
+	bytes: Uint8Array;
+	label: string;
+}
+
+/**
+ * Progressive encoding strategies from best quality to most aggressive.
+ * Each step tries harder compression to get under 10 MB.
+ */
+const ATTEMPTS: EncodeAttempt[] = [
+	{
+		crf: 23,
+		resolution: '1920:1080',
+		audioBitrate: '128k',
+		audioChannels: 2,
+		label: '1080p High Quality'
+	},
+	{
+		crf: 28,
+		resolution: '1280:720',
+		audioBitrate: '96k',
+		audioChannels: 2,
+		label: '720p Balanced'
+	},
+	{
+		crf: 32,
+		resolution: '854:480',
+		audioBitrate: '64k',
+		audioChannels: 1,
+		label: '480p Aggressive'
+	},
+	{
+		crf: 40,
+		resolution: '640:360',
+		audioBitrate: '48k',
+		audioChannels: 1,
+		label: '360p Maximum'
 	}
-	
-	/**
-	 * Progressive encoding strategies from best quality to most aggressive.
-	 * Each step tries harder compression to get under 10 MB.
-	 */
-	const ATTEMPTS: EncodeAttempt[] = [
-		{
-			crf: 23,
-			resolution: '1920:1080',
-			audioBitrate: '128k',
-			audioChannels: 2,
-			label: '1080p High Quality'
-		},
-		{
-			crf: 28,
-			resolution: '1280:720',
-			audioBitrate: '96k',
-			audioChannels: 2,
-			label: '720p Balanced'
-		},
-		{
-			crf: 32,
-			resolution: '854:480',
-			audioBitrate: '64k',
-			audioChannels: 1,
-			label: '480p Aggressive'
-		},
-		{
-			crf: 40,
-			resolution: '640:360',
-			audioBitrate: '48k',
-			audioChannels: 1,
-			label: '360p Maximum'
-		}
-	];
+];
 
 let ffmpeg: FFmpeg | null = null;
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null;
+
+/** Internal cancel callback — wired up per invocation. */
+let _cancel: (() => void) | null = null;
+
+/**
+ * Cancel an in-progress compression.
+ * The ffmpeg WASM instance is discarded (it may be in an unknown state)
+ * and will be re-created on the next call to compressVideo.
+ */
+export function cancelCompression(): void {
+	_cancel?.();
+}
 
 /**
  * Lazily initialize the ffmpeg WASM engine.
@@ -173,141 +192,216 @@ export async function initVideoEngine(): Promise<void> {
 }
 
 /**
- * Compress a video file to under 10MB using ffmpeg WASM.
+ * Compress a video file using ffmpeg WASM.
+ *
+ * Tries progressive encoding strategies from best quality to most aggressive.
+ * Returns the first result that fits under 10 MB. If none do, returns the
+ * smallest result across all attempts (best effort).
+ *
+ * Supports cancellation — call cancelCompression() to abort.
+ * ffmpeg log output is captured and included in progress updates.
  */
 export async function compressVideo(
 	file: File,
 	onProgress?: (progress: CompressionProgress) => void
 ): Promise<Blob> {
+	// Cancel any prior in-flight compression
+	_cancel?.();
+
 	const ff = await ensureFfmpeg(onProgress);
 
 	const inputName = 'input' + getExtension(file.name);
 	const outputName = 'output.mp4';
 
-	console.log(`[video] compressing ${file.name} — ${(file.size / (1024 * 1024)).toFixed(2)} MB, type: ${file.type}`);
+	// ── cancellation plumbing ──────────────────────────────────────────
+	let aborted = false;
+	const abortController = new AbortController();
+	const signal = abortController.signal;
 
-	// Write input file to virtual FS
-	onProgress?.({ percent: 5, status: 'Reading video file…' });
-	const fileData = await fetchFile(file);
-	await ff.writeFile(inputName, fileData);
-	console.log(`[video] input written to virtual FS as ${inputName}`);
+	_cancel = () => {
+		if (aborted) return;
+		aborted = true;
+		abortController.abort();
+		// Discard instance so next compression starts fresh
+		ffmpeg = null;
+		ffmpegLoadPromise = null;
+	};
 
-	// Try to probe duration for progress estimation
-	onProgress?.({ percent: 10, status: 'Analyzing video…' });
-	const duration = await probeDuration(ff, inputName);
-	if (duration) {
-		console.log(`[video] duration: ${duration.toFixed(1)}s`);
-	} else {
-		console.log('[video] could not probe duration');
+	// ── log collector ──────────────────────────────────────────────────
+	const logs: string[] = [];
+	const logHandler = ({ message }: { message: string }) => {
+		if (logs.length < MAX_LOG_LINES) {
+			logs.push(message);
+		} else if (logs.length === MAX_LOG_LINES) {
+			logs.push('… (truncated)');
+		}
+	};
+	ff.on('log', logHandler);
+
+	/** Check cancellation flag and throw if set. */
+	function checkAborted(): void {
+		if (aborted) throw new Error('Cancelled');
 	}
 
-	// Try each encoding tier
-	let lastError: string | null = null;
-	let attemptIndex = 0;
-
-	// Shared progress listener reference so we can clean up between attempts
-	let progressCallback: ((e: { progress: number }) => void) | null = null;
-
-	for (const attempt of ATTEMPTS) {
-		attemptIndex++;
-		const startPercent = 15 + (attemptIndex - 1) * 20;
-		const endPercent = Math.min(15 + attemptIndex * 20, 90);
-
-		console.log(`[video] attempt ${attemptIndex}/${ATTEMPTS.length}: ${attempt.label} (CRF ${attempt.crf}, ${attempt.resolution})`);
-
+	/** Emit progress with a snapshot of accumulated logs. */
+	function emitProgress(percent: number, status: string): void {
 		onProgress?.({
-			percent: startPercent,
-			status: `Encoding (${attempt.label})…`
+			percent,
+			status,
+			logs: [...logs]
 		});
+	}
 
-		// Clean up any previous output
-		try {
-			await ff.deleteFile(outputName);
-		} catch {
-			// File may not exist yet
+	let progressCallback: ((e: { progress: number }) => void) | null = null;
+	let bestResult: BestResult | null = null;
+
+	try {
+		console.log(
+			`[video] compressing ${file.name} — ${(file.size / (1024 * 1024)).toFixed(2)} MB, type: ${file.type}`
+		);
+
+		// ── write input to virtual FS ──────────────────────────────────
+		emitProgress(5, 'Reading video file…');
+		const fileData = await fetchFile(file);
+		await ff.writeFile(inputName, fileData);
+		console.log(`[video] input written to virtual FS as ${inputName}`);
+		checkAborted();
+
+		// ── probe duration ─────────────────────────────────────────────
+		emitProgress(10, 'Analyzing video…');
+		const duration = await probeDuration(ff, inputName);
+		if (duration) {
+			console.log(`[video] duration: ${duration.toFixed(1)}s`);
+		} else {
+			console.log('[video] could not probe duration');
 		}
 
-		// Remove previous progress listener to avoid accumulation
-		if (progressCallback) {
-			ff.off('progress', progressCallback);
-		}
+		// ── progressive encoding passes ────────────────────────────────
+		let lastError: string | null = null;
+		let attemptIndex = 0;
 
-		try {
-			const args = buildArgs(inputName, outputName, attempt);
-			console.log(`[video]   args: ffmpeg ${args.join(' ')}`);
+		for (const attempt of ATTEMPTS) {
+			checkAborted();
+			attemptIndex++;
+			const startPercent = 15 + (attemptIndex - 1) * 20;
+			const endPercent = Math.min(15 + attemptIndex * 20, 90);
 
-			// Set up progress listener for this attempt
-			progressCallback = ({ progress: p }: { progress: number }) => {
-				const mappedPercent = startPercent + (endPercent - startPercent) * p;
-				onProgress?.({
-					percent: Math.round(mappedPercent),
-					status: `Encoding (${attempt.label})…`
-				});
-			};
-			ff.on('progress', progressCallback);
+			console.log(
+				`[video] attempt ${attemptIndex}/${ATTEMPTS.length}: ${attempt.label} (CRF ${attempt.crf}, ${attempt.resolution})`
+			);
+			emitProgress(startPercent, `Encoding (${attempt.label})…`);
 
-			const exitCode = await ff.exec(args, 120000); // 2 min timeout per attempt
-
-			if (exitCode !== 0) {
-				console.warn(`[video]   ffmpeg exited with code ${exitCode}`);
-				lastError = `FFmpeg exited with code ${exitCode}`;
-				continue;
+			// Clean up any previous output
+			try {
+				await ff.deleteFile(outputName);
+			} catch {
+				// File may not exist yet
 			}
 
+			// Remove previous progress listener to avoid accumulation
+			if (progressCallback) {
+				ff.off('progress', progressCallback);
+			}
+
+			try {
+				const args = buildArgs(inputName, outputName, attempt);
+				console.log(`[video]   args: ffmpeg ${args.join(' ')}`);
+
+				// Set up progress listener for this attempt
+				progressCallback = ({ progress: p }: { progress: number }) => {
+					const mappedPercent = startPercent + (endPercent - startPercent) * p;
+					emitProgress(Math.round(mappedPercent), `Encoding (${attempt.label})…`);
+				};
+				ff.on('progress', progressCallback);
+
+				// Race encoding against cancellation so we don't wait 40 min if cancelled
+				const execPromise = ff.exec(args, ATTEMPT_TIMEOUT);
+				const cancelPromise = new Promise<never>((_, reject) => {
+					if (signal.aborted) return reject(new Error('Cancelled'));
+					const onAbort = () => reject(new Error('Cancelled'));
+					signal.addEventListener('abort', onAbort, { once: true });
+					// Clean up listener if exec finishes first
+					execPromise.then(
+						() => signal.removeEventListener('abort', onAbort),
+						() => signal.removeEventListener('abort', onAbort)
+					);
+				});
+
+				const exitCode = await Promise.race([execPromise, cancelPromise]);
+
+				if (exitCode !== 0) {
+					console.warn(`[video]   ffmpeg exited with code ${exitCode}`);
+					lastError = `FFmpeg exited with code ${exitCode}`;
+					continue;
+				}
+
 				// Read output and check size
-					const outputData = await ff.readFile(outputName);
-					// .slice(0) copies out of WASM memory and satisfies BlobPart typing
-					const outputBytes =
-						outputData instanceof Uint8Array
-							? outputData.slice(0)
-							: new TextEncoder().encode(outputData ?? '').slice(0);
+				const outputData = await ff.readFile(outputName);
+				const outputBytes =
+					outputData instanceof Uint8Array
+						? outputData.slice(0)
+						: new TextEncoder().encode(outputData ?? '').slice(0);
 
 				const sizeMB = (outputBytes.length / (1024 * 1024)).toFixed(2);
-				console.log(`[video]   output: ${sizeMB} MB — ${outputBytes.length <= MAX_BYTES ? '✓ under limit' : '✗ over limit'}`);
+				console.log(`[video]   output: ${sizeMB} MB`);
+
+				// Track best (smallest) result across all attempts
+				if (!bestResult || outputBytes.length < bestResult.bytes.length) {
+					bestResult = { bytes: outputBytes, label: attempt.label };
+				}
 
 				if (outputBytes.length <= MAX_BYTES) {
-					// Success!
-					const savedPct = Math.round((1 - outputBytes.length / file.size) * 100);
-					console.log(`[video] ✓ compressed ${(file.size / (1024 * 1024)).toFixed(2)} MB → ${sizeMB} MB (${savedPct}% saved)`);
-
-					onProgress?.({
-						percent: 95,
-						status: `Compressed to ${sizeMB} MB`
-					});
-
-					// Clean up virtual FS
-					try {
-						await ff.deleteFile(inputName);
-						await ff.deleteFile(outputName);
-					} catch {
-						// Best effort cleanup
-					}
-
+					// Under target — return immediately
+					const savedPct = Math.round(
+						(1 - outputBytes.length / file.size) * 100
+					);
+					console.log(
+						`[video] ✓ ${(file.size / (1024 * 1024)).toFixed(2)} MB → ${sizeMB} MB (${savedPct}% saved)`
+					);
+					emitProgress(95, `Compressed to ${sizeMB} MB`);
 					return new Blob([outputBytes], { type: 'video/mp4' });
 				}
 
-			lastError = `Output (${sizeMB} MB) exceeds limit`;
-		} catch (err) {
-			lastError = err instanceof Error ? err.message : String(err);
-			console.warn(`[video]   attempt ${attemptIndex} failed:`, lastError);
+				console.log(`[video]   ${sizeMB} MB — over target, trying next pass`);
+				lastError = `Output (${sizeMB} MB) exceeds target`;
+			} catch (err) {
+				if (aborted) throw new Error('Cancelled');
+				lastError = err instanceof Error ? err.message : String(err);
+				console.warn(`[video]   attempt ${attemptIndex} failed:`, lastError);
+			}
+		}
+
+		// ── all attempts exhausted — return best effort ────────────────
+		if (bestResult) {
+			const sizeMB = (bestResult.bytes.length / (1024 * 1024)).toFixed(2);
+			console.log(`[video] ✓ best effort: ${sizeMB} MB (${bestResult.label})`);
+			emitProgress(95, `Best effort: ${sizeMB} MB (${bestResult.label})`);
+			return new Blob([bestResult.bytes], { type: 'video/mp4' });
+		}
+
+		// Nothing produced usable output
+		console.error(`[video] all attempts failed. last error: ${lastError}`);
+		throw new Error(
+			`Compression failed. Last error: ${lastError ?? 'Unknown error'}`
+		);
+	} finally {
+		// ── teardown ──────────────────────────────────────────────────
+		_cancel = null;
+		ff.off('log', logHandler);
+		if (progressCallback) {
+			ff.off('progress', progressCallback);
+		}
+		try {
+			await ff.deleteFile(inputName);
+		} catch {
+			/* best effort */
+		}
+		try {
+			await ff.deleteFile(outputName);
+		} catch {
+			/* best effort */
 		}
 	}
-
-	// Clean up virtual FS and progress listener
-	try {
-		await ff.deleteFile(inputName);
-		await ff.deleteFile(outputName);
-	} catch {
-		// Best effort
-	}
-	if (progressCallback) {
-		ff.off('progress', progressCallback);
-	}
-
-	console.error(`[video] all attempts failed. last error: ${lastError}`);
-	throw new Error(
-		`Could not compress under 10 MB. Last error: ${lastError ?? 'Unknown error'}`
-	);
 }
 
 /**

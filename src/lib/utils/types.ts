@@ -23,4 +23,5 @@ export interface CompressionResult {
 export interface CompressionProgress {
 	percent: number;
 	status: string;
+	logs?: string[];
 }
