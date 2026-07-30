@@ -5,7 +5,7 @@
 		initVideoEngine,
 		cancelCompression,
 		compressAudio,
-		MAX_INPUT_BYTES,
+		getMaxInputBytes,
 		maxFeasibleSeconds,
 		maxAudioFeasibleSeconds
 	} from '$lib/utils/videoCompressor';
@@ -102,8 +102,10 @@
 		// otherwise crash the tab or burn an hour for a hopeless result.
 		if (fileInfo.type === 'video' || fileInfo.type === 'audio') {
 			const kind = fileInfo.type;
-			if (file.size > MAX_INPUT_BYTES) {
-				errorMessage = `${formatSize(file.size)} is too large for in-browser compression — the whole file must fit in memory, so the limit is ~1.5 GB`;
+			const limitBytes = getMaxInputBytes();
+			const limitGiB = (limitBytes / (1024 * 1024 * 1024)).toFixed(1);
+			if (file.size > limitBytes) {
+				errorMessage = `${formatSize(file.size)} is too large for in-browser compression — the whole file must fit in memory, so the limit is ~${limitGiB} GB`;
 				status = 'error';
 				return;
 			}

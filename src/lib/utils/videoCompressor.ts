@@ -23,12 +23,28 @@ const MAX_PASSES = 3;
 const MIN_VIDEO_BPS = 100_000;
 
 /**
- * Inputs larger than this will crash the tab: the whole file is copied
- * into the WASM heap (and once through the JS heap), and the wasm32
- * ffmpeg build can only address ~2–4 GB total. This is an architectural
- * limit of in-browser transcoding, not a policy choice.
+ * Detect the maximum input file size the browser can safely handle,
+ * based on available system memory (navigator.deviceMemory).
+ *
+ * During transcoding the input file is held ~2× in memory (once in the JS
+ * heap as a Uint8Array, once in the WASM virtual filesystem), plus working
+ * buffers for encoding.  We limit to 37.5 % of system RAM so peak usage
+ * stays under ~75 %, leaving headroom for the browser, OS, and other tabs.
+ *
+ * The wasm32 ffmpeg build can address at most ~2–4 GB total, so we cap at
+ * 2 GB regardless of available RAM.
+ *
+ * Falls back to 1.5 GB when navigator.deviceMemory is unavailable
+ * (Safari, Firefox, SSR).
  */
-export const MAX_INPUT_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024);
+export function getMaxInputBytes(): number {
+	if (typeof navigator !== 'undefined' && typeof navigator.deviceMemory === 'number') {
+		const fromSystem = Math.floor(navigator.deviceMemory * 0.375 * 1024 * 1024 * 1024);
+		const WASM_LIMIT = Math.floor(2 * 1024 * 1024 * 1024);
+		return Math.min(fromSystem, WASM_LIMIT);
+	}
+	return Math.floor(1.5 * 1024 * 1024 * 1024);
+}
 
 /** Total bitrate floor: minimum video + minimum audio (48k mono AAC). */
 const FLOOR_TOTAL_BPS = MIN_VIDEO_BPS + 48_000;
@@ -434,15 +450,17 @@ export async function compressVideo(
 	meta?: { duration?: number | null }
 ): Promise<Blob> {
 	// Hard guard: beyond this the file copy alone will crash the tab.
-	if (file.size > MAX_INPUT_BYTES) {
+	const limitBytes = getMaxInputBytes();
+	if (file.size > limitBytes) {
+		const limitGiB = (limitBytes / (1024 * 1024 * 1024)).toFixed(1);
 		throw new Error(
-			`file is too large for in-browser compression (limit ~1.5 GB)`
+			`file is too large for in-browser compression (limit ${limitGiB} GB)`
 		);
 	}
-
+	
 	// Cancel any prior in-flight compression
 	_cancel?.();
-
+	
 	const ff = await ensureFfmpeg(onProgress);
 
 	const inputName = 'input' + getExtension(file.name);
@@ -756,8 +774,10 @@ export async function compressAudio(
 	onProgress?: (progress: CompressionProgress) => void,
 	meta?: { duration?: number | null }
 ): Promise<Blob> {
-	if (file.size > MAX_INPUT_BYTES) {
-		throw new Error('file is too large for in-browser compression (limit ~1.5 GB)');
+	const limitBytes = getMaxInputBytes();
+	if (file.size > limitBytes) {
+		const limitGiB = (limitBytes / (1024 * 1024 * 1024)).toFixed(1);
+		throw new Error(`file is too large for in-browser compression (limit ${limitGiB} GB)`);
 	}
 
 	// Cancel any prior in-flight compression (audio or video)
