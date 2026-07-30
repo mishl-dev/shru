@@ -1,7 +1,13 @@
 <script lang="ts">
 	import { compressImage, initImageEngine } from '$lib/utils/imageCompressor';
-	import { compressVideo, initVideoEngine, cancelCompression } from '$lib/utils/videoCompressor';
-	import { deriveFileInfo, supportsWasm } from '$lib/utils/fileUtils';
+	import {
+		compressVideo,
+		initVideoEngine,
+		cancelCompression,
+		MAX_INPUT_BYTES,
+		maxFeasibleSeconds
+	} from '$lib/utils/videoCompressor';
+	import { deriveFileInfo, formatSize, probeVideoMetadata, supportsWasm } from '$lib/utils/fileUtils';
 	import type { AppStatus, CompressionProgress, CompressionResult } from '$lib/utils/types';
 
 	let status = $state<AppStatus>('idle');
@@ -10,8 +16,24 @@
 	let progress = $state<CompressionProgress>({ percent: 0, status: '' });
 	let result = $state<CompressionResult | null>(null);
 	let errorMessage = $state<string | null>(null);
+	let progressMeta: { duration: number } | null = null;
 	let dragOver = $state(false);
 		let enginesReady = $state(false);
+
+		const VISIBLE_LOG_LINES = 6;
+
+		// Tail of ffmpeg output. Stats updates (frame=… fps=… size=…)
+		// arrive \r-separated, so treat both \r and \n as line breaks.
+		let visibleLogs = $derived.by(() => {
+			const logs = progress.logs;
+			if (!logs || logs.length === 0) return [];
+			return logs
+				.join('\n')
+				.split(/[\r\n]+/)
+				.map((l) => l.trim())
+				.filter(Boolean)
+				.slice(-VISIBLE_LOG_LINES);
+		});
 
 		$effect(() => {
 			let aborted = false;
@@ -72,6 +94,30 @@
 		errorMessage = null;
 		result = null;
 		progress = { percent: 0, status: '' };
+
+		// ── video feasibility preflight ──────────────────────────────
+		// Runs before anything heavy: catches the cases that would
+		// otherwise crash the tab or burn an hour for a hopeless result.
+		if (fileInfo.type === 'video') {
+			if (file.size > MAX_INPUT_BYTES) {
+				errorMessage = `${formatSize(file.size)} is too large for in-browser compression — the whole file must fit in memory, so the limit is ~1.5 GB`;
+				status = 'error';
+				return;
+			}
+			const meta = await probeVideoMetadata(file);
+			if (!file) return; // user cancelled while probing
+			const maxSecs = maxFeasibleSeconds();
+			if (meta && meta.duration > maxSecs) {
+				const mins = Math.round(meta.duration / 60);
+				errorMessage = `this video is ~${mins} min long — 10 MB holds at most ~${Math.floor(maxSecs / 60)} min of video at the lowest watchable quality, so trim it first`;
+				status = 'error';
+				return;
+			}
+			progressMeta = meta ? { duration: meta.duration } : null;
+		} else {
+			progressMeta = null;
+		}
+
 		if (!enginesReady) {
 			status = 'loading-engine';
 			try {
@@ -88,8 +134,8 @@
 			let blob: Blob;
 			if (fileInfo.type === 'image') {
 				blob = await compressImage(file, (p) => (progress = p));
-			} else if (fileInfo.type === 'video') {
-				blob = await compressVideo(file, (p) => (progress = p));
+		} else if (fileInfo.type === 'video') {
+			blob = await compressVideo(file, (p) => (progress = p), progressMeta ?? undefined);
 			} else {
 				throw new Error('unsupported file type');
 			}
@@ -156,14 +202,18 @@
 		{:else if status === 'loading-engine' || status === 'compressing'}
 			<div class="content">
 				<p class="hint">{file.name}</p>
-				<div class="bar-wrap">
-					<div class="bar" style="width:{progress.percent}%"></div>
-				</div>
-				<button class="cancel-btn" onclick={handleCancel}>cancel</button>
-
-				{#if progress.logs && progress.logs.length > 0}
-						<p class="log-last">{progress.logs[progress.logs.length - 1]}</p>
-					{/if}
+			<div class="bar-wrap">
+				<div class="bar" style="width:{progress.percent}%"></div>
+			</div>
+			<p class="status-line">{progress.status || ' '}</p>
+			<div class="log-view">
+				{#each visibleLogs as line}
+					<p>{line}</p>
+				{:else}
+					<p> </p>
+				{/each}
+			</div>
+			<button class="cancel-btn" onclick={handleCancel}>cancel</button>
 			</div>
 		{:else if status === 'done' && result}
 			<div class="content">
@@ -335,14 +385,39 @@
 		border-color: var(--error);
 	}
 
-		/* ── log last line ───────────────────────────────── */
-		.log-last {
+		/* ── status line + log last line ─────────────────── */
+		.status-line {
 			width: 100%;
+			font-size: 0.75rem;
+			line-height: 1.4;
+			color: var(--ink-muted);
+			letter-spacing: 0.02em;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			margin: 0;
+		}
+
+		.log-view {
+			width: 100%;
+			height: calc(1.4em * 6 + 0.75rem);
 			font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
 			font-size: 0.6875rem;
 			line-height: 1.4;
 			color: var(--ink-faint);
 			text-align: left;
+			overflow: hidden;
+			background: color-mix(in srgb, var(--border) 30%, transparent);
+			border-radius: 6px;
+			padding: 0.375rem 0.5rem;
+			display: flex;
+			flex-direction: column;
+			justify-content: flex-end;
+			margin: 0;
+		}
+
+		.log-view p {
+			margin: 0;
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
