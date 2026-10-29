@@ -13,7 +13,7 @@
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
 	},
 	"devDependencies": {
-		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/kit": "^3.1.0",
 		"@sveltejs/vite-plugin-svelte": "^7.1.2",
 		"playwright": "^1.61.1",
 		"svelte": "^5.56.1",
@@ -26,7 +26,7 @@
 		"@ffmpeg/ffmpeg": "^0.12.15",
 		"@ffmpeg/util": "^0.12.2",
 		"@imagemagick/magick-wasm": "^0.0.41",
-		"@sveltejs/adapter-vercel": "^6.3.4"
+		"@sveltejs/adapter-vercel": "^7.0.1"
 	},
 	"overrides": {
 		"cookie": "^0.7.0"
